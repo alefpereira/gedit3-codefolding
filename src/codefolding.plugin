@@ -1,8 +1,8 @@
 [Plugin]
-Loader=python
+Loader=python3
 Module=codefolding
 IAge=3
 Name=Code folding
-Description=Code folding for gedit 3.x
+Description=Code folding for gedit 3.12
 Authors=Satyajit Chakraborty
 Copyright=Copyright © 2013 Satyajit Chakraborty

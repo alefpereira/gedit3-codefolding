@@ -1,17 +1,5 @@
-from gi.repository import GObject, Gtk, Gedit, Gdk, GtkSource
-import re, inspect, os, sys
-ui_str = """<ui>
-  <menubar name="MenuBar">
-    <menu name="ToolsMenu" action="Tools">
-      <placeholder name="ToolsOps_2">
-        <menuitem name="Toggle All Folds" action="ToggleAll"/>
-        <menuitem name="Fold Current Block" action="FoldCurrent"/>
-        <separator />
-      </placeholder>
-    </menu>
-  </menubar>
-</ui>
-"""
+from gi.repository import GObject, Gio, Gtk, Gedit, Gdk, GtkSource
+import re, inspect, os, sys, gettext
 lang_support = {
 	'C':{'startPattern':'/\*\*(?!\*)|^(?![^{]*?//|[^{]*?/\*(?!.*?\*/.*?\{)).*?\{\s*($|//|/\*(?!.*?\*/.*\S))','stopPattern':'(?<!\*)\*\*/|^\s*\}'},
 	'C++':{'startPattern':'/\*\*(?!\*)|^(?![^{]*?//|[^{]*?/\*(?!.*?\*/.*?\{)).*?\{\s*($|//|/\*(?!.*?\*/.*\S))','stopPattern':'(?<!\*)\*\*/|^\s*\}'},
@@ -36,48 +24,80 @@ lang_support = {
 	'SQL':{'startPattern':'\s*\(\s*$','stopPattern':'^\s*\)'},
 	'XML':{'startPattern':'^\s*(<[^!?%/](?!.+?(/>|</.+?>))|<[!%]--(?!.+?--%?>)|<%[!]?(?!.+?%>))','stopPattern':'^\s*(</[^>]+>|[/%]>|-->)\s*$'}
 }
+
+class CodeFoldingAppAct (GObject.Object, Gedit.AppActivatable):
+
+	app = GObject.property(type=Gedit.App)
+
+	def __init__(self):
+		GObject.Object.__init__(self)
+
+	def do_activate(self):
+		self.app.add_accelerator("<Alt><Shift>T", "win.ToggleAll", None)
+		self.app.add_accelerator("<Alt><Shift>C", "win.FoldCurrent", None)
+		self.menu_ext = self.extend_menu("view-section")
+
+		_ = lambda s: gettext.dgettext('codefolding', s)
+
+		item = Gio.MenuItem.new(_("Toggle all blocks"), "win.ToggleAll")
+		self.menu_ext.prepend_menu_item(item)
+		item = Gio.MenuItem.new(_("Fold Current Block"), "win.FoldCurrent")
+		self.menu_ext.prepend_menu_item(item)
+
+	def do_deactivate(self):
+		self.app.remove_accelerator("win.ToggleAll", None)
+		self.app.remove_accelerator("win.FoldCurrent", None)
+		self.menu_ext = None
+
 ################################################################
 # Window activatable extension
 ################################################################
 class CodeFoldingWinAct(GObject.Object, Gedit.WindowActivatable):
-	__gtype_name__ = "CodeFoldingWinAct"
+
 	window = GObject.property(type=Gedit.Window)
+
 	def __init__(self):
 		GObject.Object.__init__(self)
+
 	def do_activate(self):
 		self.worker = CodeFolder(self.window)
-		self.insert_menu()
 		self.event_id = self.window.connect('active-tab-changed',self.worker.handle_tab_activated)
+
+		self.action_toggle_all = Gio.SimpleAction(name="ToggleAll")
+		self.action_toggle_all.connect('activate',
+				lambda a, p: self.worker.on_toggle_all())
+		self.window.add_action(self.action_toggle_all)
+
+		self.action_fold_current = Gio.SimpleAction(name="FoldCurrent")
+		self.action_fold_current.connect('activate',
+				lambda a, p: self.worker.fold_current_block())
+		self.window.add_action(self.action_fold_current)
+
 	def do_deactivate(self):
 		self.window.disconnect(self.event_id)
-		self.remove_menu()
-		self._action_group = None
+		self.window.remove_action("ToggleAll")
+		self.window.remove_action("FoldCurrent")
+		self.action_toggle_all = None
+		self.action_fold_current = None
 		self.worker.clean_up()
-	def insert_menu(self):
-		manager = self.window.get_ui_manager()
-		self._action_group = Gtk.ActionGroup("FoldingPluginActions")
-		self._action_group.add_actions([("ToggleAll", None, _("Toggle All Folds"),"<Alt><Shift>T", _("Toggle all blocks"),self.worker.on_toggle_all)])
-		self._action_group.add_actions([("FoldCurrent", None, _("Fold Current Block"),"<Alt><Shift>C", _("Fold current block"),self.worker.fold_current_block)])
-		manager.insert_action_group(self._action_group, -1)
-		self._ui_id = manager.add_ui_from_string(ui_str)
-	def remove_menu(self):
-		manager = self.window.get_ui_manager()
-		manager.remove_ui(self._ui_id)
-		manager.remove_action_group(self._action_group)
-		manager.ensure_update()
+		self.worker = None
+
 	def do_update_state(self):
 		_can_activate = False
 		if self.window.get_active_document() != None:
 			_lang = self.window.get_active_document().get_language()
 			_can_activate = _lang != None and _lang.get_name() in lang_support.keys()
-		self._action_group.set_sensitive(_can_activate)
+		self.action_toggle_all.set_enabled(_can_activate)
+		self.action_fold_current.set_enabled(_can_activate)
 ################################################################
 # Main code folding worker
 ################################################################	
 class CodeFolder(GObject.Object):
 	def __init__(self,window):
 		self.window = window
-	def on_toggle_all(self,action):
+		self.tab_event_handlers = {}
+
+	def on_toggle_all(self):
 		_doc = self.get_current_document()
 		_num_lines = _doc.get_line_count()
 		_i = 0
@@ -100,7 +120,7 @@ class CodeFolder(GObject.Object):
 		_ite_r = _its_r.copy()
 		_ite_r.forward_to_line_end()
 		_lin_e = _doc.get_text(_its_r,_ite_r,False).strip()
-		
+
 		if re.search(_startPattern,_lin_e) != None:
 			_inf_o['blockstart'] = True
 		if re.search(_stopPattern,_lin_e) != None:
@@ -144,29 +164,42 @@ class CodeFolder(GObject.Object):
 		_ite_r = _doc.get_iter_at_mark(_doc.get_insert())
 		self.toggle_at_line(_ite_r.get_line())
 	def handle_tab_activated(self,win,tab):
-		self.ld_event_id = tab.get_document().connect('loaded',self.handle_doc_load)
-		self.cur_tab = tab
-	def insert_expander(self,doc):
+		# Now the signals can be treated.
+		# If already have a entry on dictionary for this tab, means that
+		# we already have signal for this tab, so we do nothing.
+		# In case of there is no entry for this means we have to create (by now, only once).
+		try:
+			if self.tab_event_handlers[tab.get_document()]:
+				pass
+		except KeyError:
+			# Giving the tab directly as argument deal with case of files loaded during Gedit startup
+			# For instance, using Restore Tab Plugin or opening a file by double-clicking it.
+			# As result, no need to self.cur_tab = tab, once it is not a safe method to do this.
+			self.tab_event_handlers[tab.get_document()] = tab.get_document().connect('loaded',self.handle_doc_load, tab)
+	def insert_expander(self,doc,tab):
 		_doc = doc
-		_view = self.cur_tab.get_view()
+		_view = tab.get_view()
 		_gutter = _view.get_gutter(Gtk.TextWindowType.LEFT)
 		_r = FoldingIndicatorRenderer()
 		_r.set_worker(self)
 		_r.set_visible(True)
 		_r.set_size(10)
 		_gutter.insert(_r,-10) #leave space for LINES and MARKS renderers
-	def handle_doc_load(self,doc,err):
-		if doc.get_language().get_name() in lang_support.keys():
-			self.insert_expander(doc)
+	def handle_doc_load(self,doc,err,tab):
+		if doc.get_language() and doc.get_language().get_name() in lang_support.keys():
+			self.insert_expander(doc, tab)
 	def clean_up(self):
-		pass
+		for tab in self.tab_event_handlers:
+			tab.disconnect(self.tab_event_handlers[tab])
+		self.tab_event_handlers.clear()
+
 	def get_current_document(self):
 		return self.window.get_active_document()
 	def get_leading_ws(self,s):
 		_view = self.cur_tab.get_view()
 		_iw = _view.get_property('tab-width')
 		return s.count('\t')*_iw+s.count('\s')
-	def fold_current_block(self,action):
+	def fold_current_block(self):
 		_bool = 0
 		_doc = self.get_current_document()
 		_iter = _doc.get_iter_at_mark(_doc.get_insert())
